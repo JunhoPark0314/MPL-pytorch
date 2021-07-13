@@ -17,6 +17,10 @@ def reduce_tensor(tensor, n):
     rt /= n
     return rt
 
+def gather_tensor_list(key, tensor, n):
+    tensor_list = []
+
+
 
 def create_loss_fn(args):
     if args.label_smoothing > 0:
@@ -31,7 +35,7 @@ def module_load_state_dict(model, state_dict):
     for k, v in state_dict.items():
         name = k[7:]  # remove `module.`
         new_state_dict[name] = v
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict, strict=True)
 
 
 def model_load_state_dict(model, state_dict):

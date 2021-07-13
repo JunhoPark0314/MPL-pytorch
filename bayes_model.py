@@ -5,6 +5,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from bayes_layer import Conv2dFlipout, LinearFlipout
+import bayesian_torch.models.bayesian.resnet_flipout as BayesResNet
 
 logger = logging.getLogger(__name__)
 
@@ -41,42 +43,66 @@ class ModelEMA(nn.Module):
 
     def load_state_dict(self, state_dict):
         self.module.load_state_dict(state_dict)
- 
 
-class BasicBlock(nn.Module):
+class BayesBasicBlock(nn.Module):
+    expansion=1
+
     def __init__(self, in_planes, out_planes, stride, dropout=0.0, activate_before_residual=False):
-        super(BasicBlock, self).__init__()
+        super(BayesBasicBlock, self).__init__()
+
         self.bn1 = nn.BatchNorm2d(in_planes, momentum=0.01, eps=1e-3)
         self.relu1 = nn.ReLU(inplace=True)
-        self.conv1 = nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+        self.conv1 = Conv2dFlipout(in_planes, out_planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_planes, momentum=0.01, eps=1e-3)
         self.relu2 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_planes, out_planes, kernel_size=3, stride=1,
+        self.conv2 = Conv2dFlipout(out_planes, out_planes, kernel_size=3, stride=1,
                                padding=1, bias=False)
         self.dropout = dropout
         self.equalInOut = (in_planes == out_planes)
-        self.convShortcut = (not self.equalInOut) and nn.Conv2d(in_planes, out_planes,
-                                                                kernel_size=1, stride=stride,
-                                                                padding=0, bias=False) or None
+
+        self.convShortcut = (not self.equalInOut) and Conv2dFlipout(in_planes,
+                                  self.expansion * out_planes,
+                                  kernel_size=1,
+                                  stride=stride,
+                                  padding=0,
+                                  bias=False) or None
         self.activate_before_residual = activate_before_residual
 
     def forward(self, x):
+        whole_sampled = {}
         if not self.equalInOut and self.activate_before_residual == True:
-            x = self.relu1(self.bn1(x))
+            x = F.relu(self.bn1(x))
         else:
-            out = self.relu1(self.bn1(x))
-        out = self.relu2(self.bn2(self.conv1(out if self.equalInOut else x)))
+            out = F.relu(self.bn1(x))
+        
+        kl_sum = 0
+
+        out, kl, sampled = self.conv1(out if self.equalInOut else x)
+        whole_sampled["conv1"] = sampled
+        kl_sum += kl
+
+        out = F.relu(self.bn2(out))
         if self.dropout > 0:
             out = F.dropout(out, p=self.dropout, training=self.training)
-        out = self.conv2(out)
-        return torch.add(x if self.equalInOut else self.convShortcut(x), out)
 
+        out, kl, sampled = self.conv2(out)
+        kl_sum += kl
+        whole_sampled["conv2"] = sampled
 
-class NetworkBlock(nn.Module):
+        if not self.equalInOut:
+            short, kl, sampled = self.convShortcut(x)
+            kl_sum += kl
+            whole_sampled["short"] = sampled
+        else:
+            short = x
+
+        return torch.add(short, out),  kl_sum, whole_sampled
+
+class BayesNetworkBlock(nn.Module):
     def __init__(self, nb_layers, in_planes, out_planes, block, stride, dropout=0.0,
                  activate_before_residual=False):
-        super(NetworkBlock, self).__init__()
+        super(BayesNetworkBlock, self).__init__()
         self.layer = self._make_layer(
             block, in_planes, out_planes, nb_layers, stride, dropout, activate_before_residual)
 
@@ -89,65 +115,81 @@ class NetworkBlock(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.layer(x)
+        kl_sum = 0 
+        whole_sampled = {}
+        out = x
+        for id, l in enumerate(self.layer):
+            out, kl, sampled = l(out)
+            kl_sum += kl
+            whole_sampled[id] = sampled
+        return out, kl, whole_sampled
 
 
-class WideResNet(nn.Module):
+class BayesWideResNet(nn.Module):
     def __init__(self, num_classes, depth=28, widen_factor=2, dropout=0.0, dense_dropout=0.0):
-        super(WideResNet, self).__init__()
+        super(BayesWideResNet, self).__init__()
         channels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor]
         assert((depth - 4) % 6 == 0)
         n = (depth - 4) / 6
-        block = BasicBlock
+        block = BayesBasicBlock
         # 1st conv before any network block
-        self.conv1 = nn.Conv2d(3, channels[0], kernel_size=3, stride=1,
+        self.conv1 = Conv2dFlipout(3, channels[0], kernel_size=3, stride=1,
                                padding=1, bias=False)
         # 1st block
-        self.block1 = NetworkBlock(
+        self.block1 = BayesNetworkBlock(
             n, channels[0], channels[1], block, 1, dropout, activate_before_residual=True)
         # 2nd block
-        self.block2 = NetworkBlock(
+        self.block2 = BayesNetworkBlock(
             n, channels[1], channels[2], block, 2, dropout)
         # 3rd block
-        self.block3 = NetworkBlock(
+        self.block3 = BayesNetworkBlock(
             n, channels[2], channels[3], block, 2, dropout)
         # global average pooling and classifier
         self.bn1 = nn.BatchNorm2d(channels[3], momentum=0.01, eps=1e-3)
         self.relu = nn.ReLU(inplace=True)
         self.drop = nn.Dropout(dense_dropout)
-        self.fc = nn.Linear(channels[3], num_classes)
+        self.fc = LinearFlipout(channels[3], num_classes)
         self.channels = channels[3]
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight,
-                                        mode='fan_out',
-                                        nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1.0)
-                nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                nn.init.constant_(m.bias, 0.0)
+        self.apply(BayesResNet._weights_init)
 
     def forward(self, x):
-        out = self.conv1(x)
-        out = self.block1(out)
-        out = self.block2(out)
-        out = self.block3(out)
+        kl_sum = 0
+        whole_sampled = {}
+
+        out, kl, sampled = self.conv1(x)
+        kl_sum += kl
+        whole_sampled["conv1"] = sampled
+
+        out, kl, sampled = self.block1(out)
+        kl_sum += kl
+        whole_sampled["block1"] = sampled
+
+        out, kl, sampled = self.block2(out)
+        kl_sum += kl
+        whole_sampled["block2"] = sampled
+
+        out, kl, sampled = self.block3(out)
+        kl_sum += kl
+        whole_sampled["block3"] = sampled
+
         out = self.relu(self.bn1(out))
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(-1, self.channels)
-        return self.fc(self.drop(out))
 
+        out, kl, sampled = self.fc(self.drop(out))
+        whole_sampled["fc"] = sampled
 
-def build_wideresnet(args):
+        kl_sum += kl
+        return out, kl, whole_sampled
+
+def build_bayes_wideresnet(args):
     if args.dataset == "cifar10":
         depth, widen_factor = 28, 2
     elif args.dataset == 'cifar100':
         depth, widen_factor = 28, 8
 
-    model = WideResNet(num_classes=args.num_classes,
+    model = BayesWideResNet(num_classes=args.num_classes,
                        depth=depth,
                        widen_factor=widen_factor,
                        dropout=0,
