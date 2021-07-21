@@ -109,10 +109,11 @@ def get_lr(optimizer):
 
 def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                teacher_model, student_model, avg_student_model, criterion,
-               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler):
+               t_optimizer, s_optimizer_l, s_optimizer_u, t_scheduler, s_scheduler_l, s_scheduler_u, t_scaler, s_scaler):
     logger.info("***** Running Training *****")
     logger.info(f"   Task = {args.dataset}@{args.num_labeled}")
     logger.info(f"   Total steps = {args.total_steps}")
+    eps = 1e-2
 
     if args.world_size > 1:
         labeled_epoch = 0
@@ -192,30 +193,37 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             s_logits_us = s_logits[batch_size:]
             del s_logits
 
+            """
             s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
             s_loss = criterion(s_logits_us, hard_pseudo_label)
+            """
+
+            s_loss_u_old = F.cross_entropy(s_logits_us.detach(), hard_pseudo_label, reduction="none")
+            s_loss = criterion(s_logits_l, targets)
 
         s_scaler.scale(s_loss).backward()
         if args.grad_clip > 0:
-            s_scaler.unscale_(s_optimizer)
+            s_scaler.unscale_(s_optimizer_l)
             nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
-        s_scaler.step(s_optimizer)
+        s_scaler.step(s_optimizer_l)
         s_scaler.update()
-        s_scheduler.step()
-        if args.ema > 0:
-            avg_student_model.update_parameters(student_model)
+        s_scheduler_l.step()
 
         with amp.autocast(enabled=args.amp):
+            """
             with torch.no_grad():
-                s_logits_l = student_model(images_l)
-            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)
+                s_logits_us = student_model(images_us)
+            """
+            s_logits_us = student_model(images_us)
+            s_loss_u_new = F.cross_entropy(s_logits_us, hard_pseudo_label, reduction="none")
             # dot_product = s_loss_l_new - s_loss_l_old
             # test
-            dot_product = s_loss_l_old - s_loss_l_new
+            dot_product = s_loss_u_new.detach() - s_loss_u_old
             # moving_dot_product = moving_dot_product * 0.99 + dot_product * 0.01
             # dot_product = dot_product - moving_dot_product
             _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)
-            t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)
+            curr_lr = get_lr(s_optimizer_l)
+            t_loss_mpl = (dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label, reduction="none")).mean() / (curr_lr + eps)
             t_loss = t_loss_uda + t_loss_mpl
 
         t_scaler.scale(t_loss).backward()
@@ -228,6 +236,17 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
         teacher_model.zero_grad()
         student_model.zero_grad()
+
+        s_scaler.scale(s_loss_u_new.mean()).backward()
+        if args.grad_clip > 0:
+            s_scaler.unscale_(s_optimizer_u)
+            nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
+        s_scaler.step(s_optimizer_u)
+        s_scaler.update()
+        s_scheduler_u.step()
+
+        if args.ema > 0:
+            avg_student_model.update_parameters(student_model)
 
         if args.world_size > 1:
             s_loss = reduce_tensor(s_loss.detach(), args.world_size)
@@ -247,13 +266,13 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         batch_time.update(time.time() - end)
         pbar.set_description(
             f"Train Iter: {step+1:3}/{args.total_steps:3}. "
-            f"LR: {get_lr(s_optimizer):.4f}. Data: {data_time.avg:.2f}s. "
+            f"LR: {get_lr(s_optimizer_l):.4f}. Data: {data_time.avg:.2f}s. "
             f"Batch: {batch_time.avg:.2f}s. S_Loss: {s_losses.avg:.4f}. "
             f"T_Loss: {t_losses.avg:.4f}. Mask: {mean_mask.avg:.4f}. ")
         pbar.update()
         if args.local_rank in [-1, 0]:
-            args.writer.add_scalar("lr", get_lr(s_optimizer), step)
-            wandb.log({"lr": get_lr(s_optimizer)})
+            args.writer.add_scalar("lr", get_lr(s_optimizer_l), step)
+            wandb.log({"lr": get_lr(s_optimizer_l)})
 
         args.num_eval = step//args.eval_step
         if (step+1) % args.eval_step == 0:
@@ -298,15 +317,17 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                     'best_top1': args.best_top1,
                     'best_top5': args.best_top5,
                     'teacher_optimizer': t_optimizer.state_dict(),
-                    'student_optimizer': s_optimizer.state_dict(),
+                    'student_optimizer_label': s_optimizer_l.state_dict(),
+                    'student_optimizer_unlabel': s_optimizer_u.state_dict(),
                     'teacher_scheduler': t_scheduler.state_dict(),
-                    'student_scheduler': s_scheduler.state_dict(),
+                    'student_scheduler_label': s_scheduler_l.state_dict(),
+                    'student_scheduler_unlabel': s_scheduler_u.state_dict(),
                     'teacher_scaler': t_scaler.state_dict(),
                     'student_scaler': s_scaler.state_dict(),
                 }, is_best)
     # finetune
     del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader
-    del s_scaler, s_scheduler, s_optimizer
+    del s_scaler, s_scheduler_l, s_optimizer_l, s_scheduler_u, s_optimizer_u
     ckpt_name = f'{args.save_path}/{args.name}_best.pth.tar'
     loc = f'cuda:{args.gpu}'
     checkpoint = torch.load(ckpt_name, map_location=loc)
@@ -542,7 +563,13 @@ def main():
                             momentum=args.momentum,
                             # weight_decay=args.weight_decay,
                             nesterov=args.nesterov)
-    s_optimizer = optim.SGD(student_parameters,
+    s_optimizer_l = optim.SGD(student_parameters,
+                            lr=args.student_lr,
+                            momentum=args.momentum,
+                            # weight_decay=args.weight_decay,
+                            nesterov=args.nesterov)
+
+    s_optimizer_u = optim.SGD(student_parameters,
                             lr=args.student_lr,
                             momentum=args.momentum,
                             # weight_decay=args.weight_decay,
@@ -551,7 +578,11 @@ def main():
     t_scheduler = get_cosine_schedule_with_warmup(t_optimizer,
                                                   args.warmup_steps,
                                                   args.total_steps)
-    s_scheduler = get_cosine_schedule_with_warmup(s_optimizer,
+    s_scheduler_l = get_cosine_schedule_with_warmup(s_optimizer_l,
+                                                  args.warmup_steps,
+                                                  args.total_steps,
+                                                  args.student_wait_steps)
+    s_scheduler_u = get_cosine_schedule_with_warmup(s_optimizer_u,
                                                   args.warmup_steps,
                                                   args.total_steps,
                                                   args.student_wait_steps)
@@ -570,9 +601,11 @@ def main():
             if not (args.evaluate or args.finetune):
                 args.start_step = checkpoint['step']
                 t_optimizer.load_state_dict(checkpoint['teacher_optimizer'])
-                s_optimizer.load_state_dict(checkpoint['student_optimizer'])
+                s_optimizer_l.load_state_dict(checkpoint['student_optimizer_label'])
+                s_optimizer_l.load_state_dict(checkpoint['student_optimizer_unlabel'])
                 t_scheduler.load_state_dict(checkpoint['teacher_scheduler'])
-                s_scheduler.load_state_dict(checkpoint['student_scheduler'])
+                s_scheduler_l.load_state_dict(checkpoint['student_scheduler_label'])
+                s_scheduler_u.load_state_dict(checkpoint['student_scheduler_unlabel'])
                 t_scaler.load_state_dict(checkpoint['teacher_scaler'])
                 s_scaler.load_state_dict(checkpoint['student_scaler'])
                 model_load_state_dict(teacher_model, checkpoint['teacher_state_dict'])
@@ -599,13 +632,13 @@ def main():
 
     if args.finetune:
         del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader
-        del s_scaler, s_scheduler, s_optimizer
+        del s_scaler, s_scheduler_l, s_optimizer_l, s_scheduler_u, s_optimizer_u
         finetune(args, labeled_loader, test_loader, student_model, criterion)
         return
 
     if args.evaluate:
         del t_scaler, t_scheduler, t_optimizer, teacher_model, unlabeled_loader, labeled_loader
-        del s_scaler, s_scheduler, s_optimizer
+        del s_scaler, s_scheduler_l, s_optimizer_l, s_scheduler_u, s_optimizer_u
         evaluate(args, test_loader, student_model, criterion)
         return
 
@@ -613,7 +646,7 @@ def main():
     student_model.zero_grad()
     train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                teacher_model, student_model, avg_student_model, criterion,
-               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler)
+               t_optimizer, s_optimizer_l, s_optimizer_u, t_scheduler, s_scheduler_l, s_scheduler_u, t_scaler, s_scaler)
     return
 
 

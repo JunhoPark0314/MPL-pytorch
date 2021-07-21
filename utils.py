@@ -83,13 +83,16 @@ class SmoothCrossEntropy(nn.Module):
         super(SmoothCrossEntropy, self).__init__()
         self.alpha = alpha
 
-    def forward(self, logits, labels):
+    def forward(self, logits, labels, mean=True):
         num_classes = logits.shape[-1]
         alpha_div_k = self.alpha / num_classes
         target_probs = F.one_hot(labels, num_classes=num_classes).float() * \
             (1. - self.alpha) + alpha_div_k
         loss = -(target_probs * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
-        return loss.mean()
+        if mean:
+            return loss.mean()
+        else:
+            return loss
 
 
 class AverageMeter(object):
