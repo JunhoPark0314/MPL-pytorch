@@ -6,6 +6,7 @@ from collections import OrderedDict
 import torch
 from torch import distributed as dist
 from torch import nn
+from torch.distributed.distributed_c10d import gather
 from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,12 @@ def reduce_tensor(tensor, n):
     rt /= n
     return rt
 
+def gather_tensor(tensor, n):
+    gather_list = []
+    for i in range(n):
+        gather_list.append(torch.zeros_like(tensor))
+    dist.all_gather(gather_list, tensor)
+    return gather_list
 
 def create_loss_fn(args):
     if args.label_smoothing > 0:

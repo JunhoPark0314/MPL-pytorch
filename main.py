@@ -4,6 +4,7 @@ import math
 import os
 import random
 import time
+import copy
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from tqdm import tqdm
 
 from data import DATASET_GETTERS
 from models import WideResNet, ModelEMA
-from utils import (AverageMeter, accuracy, create_loss_fn,
+from utils import (AverageMeter, accuracy, create_loss_fn, gather_tensor,
                    save_checkpoint, reduce_tensor, model_load_state_dict)
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,13 @@ def set_seed(args):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+def set_bn_eval(m):
+    if isinstance(m, nn.modules.batchnorm._BatchNorm):
+        m.track_running_stats = False
+
+def set_bn_train(m):
+    if isinstance(m, nn.modules.batchnorm._BatchNorm):
+        m.track_running_stats = True
 
 def get_cosine_schedule_with_warmup(optimizer,
                                     num_warmup_steps,
@@ -139,6 +147,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             t_losses_u = AverageMeter()
             t_losses_mpl = AverageMeter()
             mean_mask = AverageMeter()
+            dot_product_mean = AverageMeter()
+            dot_product_std = AverageMeter()
 
         teacher_model.train()
         student_model.train()
@@ -168,6 +178,9 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         images_uw = images_uw.to(args.device)
         images_us = images_us.to(args.device)
         targets = targets.to(args.device)
+
+        student_model.apply(set_bn_eval)
+        checkpoint = copy.deepcopy(student_model.state_dict())
         with amp.autocast(enabled=args.amp):
             batch_size = images_l.shape[0]
             t_images = torch.cat((images_l, images_uw, images_us))
@@ -208,14 +221,17 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         s_scaler.step(s_optimizer_l)
         s_scaler.update()
         s_scheduler_l.step()
-
         with amp.autocast(enabled=args.amp):
             """
             with torch.no_grad():
                 s_logits_us = student_model(images_us)
             """
-            s_logits_us = student_model(images_us)
-            s_loss_u_new = F.cross_entropy(s_logits_us, hard_pseudo_label, reduction="none")
+            s_images = torch.cat((images_l, images_us))
+            s_logits = student_model(s_images)
+            s_logits_l_new = s_logits[:batch_size]
+            s_logits_us_new = s_logits[batch_size:]
+
+            s_loss_u_new = F.cross_entropy(s_logits_us_new, hard_pseudo_label, reduction="none")
             # dot_product = s_loss_l_new - s_loss_l_old
             # test
             dot_product = s_loss_u_new.detach() - s_loss_u_old
@@ -237,7 +253,15 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         teacher_model.zero_grad()
         student_model.zero_grad()
 
-        s_scaler.scale(s_loss_u_new.mean()).backward()
+        student_model.load_state_dict(checkpoint)
+        student_model.apply(set_bn_train)
+        with amp.autocast(enabled=args.amp):
+            s_logits_us = student_model(images_us)
+            t_logits_us = teacher_model(images_us)
+            _, hard_pseudo_label = torch.max(t_logits_us, dim=-1)
+            s_loss_u_new = F.cross_entropy(s_logits_us, hard_pseudo_label)
+
+        s_scaler.scale(s_loss_u_new).backward()
         if args.grad_clip > 0:
             s_scaler.unscale_(s_optimizer_u)
             nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
@@ -255,6 +279,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             t_loss_u = reduce_tensor(t_loss_u.detach(), args.world_size)
             t_loss_mpl = reduce_tensor(t_loss_mpl.detach(), args.world_size)
             mask = reduce_tensor(mask, args.world_size)
+            dot_product = gather_tensor(dot_product, args.world_size)
+            dot_product = torch.cat(dot_product)
 
         s_losses.update(s_loss.item())
         t_losses.update(t_loss.item())
@@ -262,6 +288,9 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         t_losses_u.update(t_loss_u.item())
         t_losses_mpl.update(t_loss_mpl.item())
         mean_mask.update(mask.mean().item())
+        dot_product_mean.update(dot_product.mean().item())
+        dot_product_std.update(dot_product.std().item())
+
 
         batch_time.update(time.time() - end)
         pbar.set_description(
@@ -274,6 +303,16 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             args.writer.add_scalar("lr", get_lr(s_optimizer_l), step)
             wandb.log({"lr": get_lr(s_optimizer_l)})
 
+        if args.local_rank in [-1, 0]:
+            args.writer.add_scalar("train/1.s_loss_it", s_losses.avg, step)
+            args.writer.add_scalar("train/2.t_loss_it", t_losses.avg, step)
+            args.writer.add_scalar("train/3.t_labeled_it", t_losses_l.avg, step)
+            args.writer.add_scalar("train/4.t_unlabeled_it", t_losses_u.avg, step)
+            args.writer.add_scalar("train/5.t_mpl_it", t_losses_mpl.avg, step)
+            args.writer.add_scalar("train/6.mask_it", mean_mask.avg, step)
+            args.writer.add_scalar("train/7.dp_mean_it", dot_product_mean.avg, step)
+            args.writer.add_scalar("train/8.dp_std_it", dot_product_std.avg, step)
+
         args.num_eval = step//args.eval_step
         if (step+1) % args.eval_step == 0:
             pbar.close()
@@ -284,6 +323,8 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                 args.writer.add_scalar("train/4.t_unlabeled", t_losses_u.avg, args.num_eval)
                 args.writer.add_scalar("train/5.t_mpl", t_losses_mpl.avg, args.num_eval)
                 args.writer.add_scalar("train/6.mask", mean_mask.avg, args.num_eval)
+                args.writer.add_scalar("train/7.dp_mean", dot_product_mean.avg, args.num_eval)
+                args.writer.add_scalar("train/8.dp_std", dot_product_std.avg, args.num_eval)
                 wandb.log({"train/1.s_loss": s_losses.avg,
                            "train/2.t_loss": t_losses.avg,
                            "train/3.t_labeled": t_losses_l.avg,
