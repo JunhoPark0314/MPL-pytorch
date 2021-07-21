@@ -147,3 +147,5 @@ dmypy.json
 results/
 wandb/
 run.sh
+results
+data
