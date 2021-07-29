@@ -5,10 +5,10 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from bayesian_torch.models.bayesian.wideresnet_flipout import WideResNet as BayesWideResNet
 
 logger = logging.getLogger(__name__)
-
-
+ 
 class ModelEMA(nn.Module):
     def __init__(self, model, decay=0.9999, device=None):
         super().__init__()
@@ -140,6 +140,20 @@ class WideResNet(nn.Module):
         out = out.view(-1, self.channels)
         return self.fc(self.drop(out))
 
+class BayesWrappedWideResNet(nn.Module):
+    def __init__(self, num_classes, depth=28, widen_factor=2, dropout=0.0, dense_dropout=0.0):
+        super(BayesWrappedWideResNet, self).__init__()
+        self.model = BayesWideResNet(num_classes = num_classes,
+                                        depth = depth, 
+                                        widen_factor = widen_factor,
+                                        dropout = 0,
+                                        dense_dropout = dense_dropout)
+    
+    def forward(self, x):
+        sampled_weight, kl = self.model.sample()
+        mu, sigma = self.model.dist_param()
+        out = self.model(x)
+        return out, kl, sampled_weight, mu, sigma
 
 def build_wideresnet(args):
     if args.dataset == "cifar10":
