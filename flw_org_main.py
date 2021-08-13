@@ -14,15 +14,12 @@ from torch import optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 from tqdm import tqdm
 
-from meta_optim import SGD_LM
-import copy
 from data import DATASET_GETTERS
-from models import BayesWrappedWideResNet, WideResNet, ModelEMA
+from models import WideResNet, ModelEMA
 from utils import (AverageMeter, accuracy, create_loss_fn,
                    save_checkpoint, reduce_tensor, model_load_state_dict)
 
@@ -73,13 +70,9 @@ parser.add_argument('--lambda-u', default=1, type=float, help='coefficient of un
 parser.add_argument('--uda-steps', default=1, type=float, help='warmup steps of lambda-u')
 parser.add_argument("--randaug", nargs="+", type=int, help="use it like this. --randaug 2 10")
 parser.add_argument("--amp", action="store_true", help="use 16-bit (mixed) precision")
-parser.add_argument("--mpl-weight", default=0.0, type=float, help="mpl loss weight")
 parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument("--local_rank", type=int, default=-1,
-                    help="For distributed training: local_rank")
-
-parser.add_argument("--grad-scale-log", action="store_true",
                     help="For distributed training: local_rank")
 
 
@@ -89,19 +82,6 @@ def set_seed(args):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-def set_bn_eval(m):
-    if isinstance(m, nn.modules.batchnorm._BatchNorm):
-        m.track_running_stats = False
-        #m.eval()
-    if isinstance(m, nn.modules.dropout._DropoutNd):
-        m.eval()
-
-def set_bn_train(m):
-    if isinstance(m, nn.modules.batchnorm._BatchNorm):
-        m.track_running_stats = True
-        #m.train()
-    if isinstance(m, nn.modules.dropout._DropoutNd):
-        m.train()
 
 def get_cosine_schedule_with_warmup(optimizer,
                                     num_warmup_steps,
@@ -129,7 +109,7 @@ def get_lr(optimizer):
 
 def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                teacher_model, student_model, avg_student_model, criterion,
-               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler, test_tool):
+               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler):
     logger.info("***** Running Training *****")
     logger.info(f"   Task = {args.dataset}@{args.num_labeled}")
     logger.info(f"   Total steps = {args.total_steps}")
@@ -142,7 +122,6 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
     labeled_iter = iter(labeled_loader)
     unlabeled_iter = iter(unlabeled_loader)
-    s_optimizer_test, s_scheduler_test = test_tool
 
     # moving_dot_product = torch.empty(1).to(args.device)
     # limit = 3.0**(0.5)  # 3 = 6 / (f_in + f_out)
@@ -159,13 +138,6 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             t_losses_u = AverageMeter()
             t_losses_mpl = AverageMeter()
             mean_mask = AverageMeter()
-            if args.grad_scale_log:
-                l_grad_mean = AverageMeter()
-                mpl_grad_mean = AverageMeter()
-                kl_grad_mean = AverageMeter()
-                l_grad_sig = AverageMeter()
-                mpl_grad_sig = AverageMeter()
-                kl_grad_sig = AverageMeter()
 
         teacher_model.train()
         student_model.train()
@@ -195,15 +167,10 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
         images_uw = images_uw.to(args.device)
         images_us = images_us.to(args.device)
         targets = targets.to(args.device)
-        
-        checkpoint = copy.deepcopy(student_model.state_dict())
-        student_model.apply(set_bn_eval)
-
         with amp.autocast(enabled=args.amp):
             batch_size = images_l.shape[0]
             t_images = torch.cat((images_l, images_uw, images_us))
-            t_logits, t_loss_kl, sampled_teacher, t_mu, t_sigma = teacher_model(t_images)
-
+            t_logits = teacher_model(t_images)
             t_logits_l = t_logits[:batch_size]
             t_logits_uw, t_logits_us = t_logits[batch_size:].chunk(2)
             del t_logits
@@ -225,67 +192,31 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             s_logits_us = s_logits[batch_size:]
             del s_logits
 
-            s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets, reduction="none")
-            s_loss = nn.KLDivLoss(reduction="batchmean")(F.log_softmax(s_logits_us),soft_pseudo_label)
-            s_perf = s_logits_l.detach().softmax(dim=1)[torch.arange(len(s_logits_l)), targets]
-            #s_loss = criterion(s_logits_us, hard_pseudo_label)
+            s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
+            s_loss = criterion(s_logits_us, hard_pseudo_label)
 
         s_scaler.scale(s_loss).backward()
         if args.grad_clip > 0:
-            s_scaler.unscale_(s_optimizer_test)
+            s_scaler.unscale_(s_optimizer)
             nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
         s_scaler.step(s_optimizer)
         s_scaler.update()
-        s_scheduler_test.step()
+        s_scheduler.step()
+        if args.ema > 0:
+            avg_student_model.update_parameters(student_model)
 
         with amp.autocast(enabled=args.amp):
             with torch.no_grad():
-                s_images = torch.cat((images_l, images_us))
-                s_logits = student_model(s_images)
-                s_logits_l = s_logits[:batch_size]
-                s_logits_us = s_logits[batch_size:]
-            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets, reduction="none")
+                s_logits_l = student_model(images_l)
+            s_loss_l_new = F.cross_entropy(s_logits_l.detach(), targets)
             # dot_product = s_loss_l_new - s_loss_l_old
             # test
-            #dot_product = (s_loss_l_old - s_loss_l_new) / (get_lr(s_optimizer_test) + 1e-5)
-            dot_product = ((s_loss_l_old - s_loss_l_new) * s_perf / (get_lr(s_optimizer_test) + 1e-5)).mean()
+            dot_product = s_loss_l_old - s_loss_l_new
             # moving_dot_product = moving_dot_product * 0.99 + dot_product * 0.01
             # dot_product = dot_product - moving_dot_product
             _, hard_pseudo_label = torch.max(t_logits_us.detach(), dim=-1)
-            t_log_prob = -Normal(loc=t_mu, scale=t_sigma).log_prob(sampled_teacher)
-            #squared = (sampled_teacher - t_mu) ** 2 
-            #var = t_sigma ** 2
-            #t_log_prob = squared #/ (var + 1e-9) + var.log()
-
-            #t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)
-            kl_weight = 2 ** (-step/args.total_steps * 0.5)
-
-            t_loss_mpl = (dot_product * t_log_prob * args.mpl_weight).sum() / len(s_images)
-            t_loss_kl = t_loss_kl * kl_weight / (len(s_images) * len(t_log_prob))
-            t_loss = t_loss_uda + t_loss_mpl + t_loss_kl
-
-        if args.grad_scale_log:
-            t_scaler.scale(t_loss_uda).backward(retain_graph=True)
-            l_grad = copy.deepcopy(teacher_model.model.conv1.rho_kernel.grad)
-            t_optimizer.zero_grad()
-
-            l_grad_mean.update(l_grad.abs().mean())
-            l_grad_sig.update(l_grad.abs().std())
-
-            t_scaler.scale(t_loss_mpl).backward(retain_graph=True)
-            mpl_grad = copy.deepcopy(teacher_model.model.conv1.rho_kernel.grad)
-            t_optimizer.zero_grad()
-
-            mpl_grad_mean.update(mpl_grad.abs().mean())
-            mpl_grad_sig.update(mpl_grad.abs().std())
-
-            t_scaler.scale(t_loss_kl).backward(retain_graph=True)
-            kl_grad = copy.deepcopy(teacher_model.model.conv1.rho_kernel.grad)
-            t_optimizer.zero_grad()
-
-            kl_grad_mean.update(kl_grad.abs().mean())
-            kl_grad_sig.update(kl_grad.abs().std())
-
+            t_loss_mpl = dot_product * F.cross_entropy(t_logits_us, hard_pseudo_label)
+            t_loss = t_loss_uda + t_loss_mpl
 
         t_scaler.scale(t_loss).backward()
         if args.grad_clip > 0:
@@ -297,41 +228,6 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
         teacher_model.zero_grad()
         student_model.zero_grad()
-
-        student_model.load_state_dict(checkpoint)
-        student_model.apply(set_bn_train)
-
-        with amp.autocast(enabled=args.amp):
-            batch_size = images_l.shape[0]
-            t_images = torch.cat((images_l, images_uw, images_us))
-            t_logits, _, sampled_teacher, t_mu, t_sigma = teacher_model(t_images)
-            t_logits_l = t_logits[:batch_size]
-            t_logits_uw, t_logits_us = t_logits[batch_size:].chunk(2)
-            del t_logits
-
-            soft_pseudo_label = torch.softmax(t_logits_uw.detach()/args.temperature, dim=-1)
-
-            s_images = torch.cat((images_l, images_us))
-            s_logits = student_model(s_images)
-            s_logits_l = s_logits[:batch_size]
-            s_logits_us = s_logits[batch_size:]
-            del s_logits
-
-            #s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
-            s_loss = nn.KLDivLoss(reduction="batchmean")(F.log_softmax(s_logits_us),soft_pseudo_label)
-            #s_loss = criterion(s_logits_us, hard_pseudo_label)
-
-        s_scaler.scale(s_loss).backward()
-
-        if args.grad_clip > 0:
-            s_scaler.unscale_(s_optimizer)
-            nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip)
-        s_scaler.step(s_optimizer)
-        s_scaler.update()
-        s_scheduler.step()
-
-        if args.ema > 0:
-            avg_student_model.update_parameters(student_model)
 
         if args.world_size > 1:
             s_loss = reduce_tensor(s_loss.detach(), args.world_size)
@@ -353,23 +249,7 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             f"Train Iter: {step+1:3}/{args.total_steps:3}. "
             f"LR: {get_lr(s_optimizer):.4f}. Data: {data_time.avg:.2f}s. "
             f"Batch: {batch_time.avg:.2f}s. S_Loss: {s_losses.avg:.4f}. "
-            f"T_Loss: {t_losses_l.avg:.4f}. Mask: {mean_mask.avg:.4f}. ")
-        
-        if args.grad_scale_log:
-            print(
-                f"l_m : {l_grad_mean.val:.2e} "
-                f"mpl_m : {mpl_grad_mean.val:.2e} "
-                f"kl_m : {kl_grad_mean.val:.2e} "
-                f"l_s : {l_grad_sig.val:.2e} "
-                f"mpl_s : {mpl_grad_sig.val:.2e} "
-                f"kl_s : {kl_grad_sig.val:.2e} \n"
-                f"l_loss : {t_loss_l:.4f} "
-                f"mpl_loss : {t_loss_mpl:.4f} "
-                f"kl_loss : {t_loss_kl:.4f} "
-                f"dot_product : {dot_product:.4f} "
-            )
-
-
+            f"T_Loss: {t_losses.avg:.4f}. Mask: {mean_mask.avg:.4f}. ")
         pbar.update()
         if args.local_rank in [-1, 0]:
             args.writer.add_scalar("lr", get_lr(s_optimizer), step)
@@ -394,15 +274,10 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
                 test_model = avg_student_model if avg_student_model is not None else student_model
                 test_loss, top1, top5 = evaluate(args, test_loader, test_model, criterion)
-                test_loss_t, top1_t, top5_t = evaluate(args, test_loader, teacher_model, criterion, bayes=True)
 
                 args.writer.add_scalar("test/loss", test_loss, args.num_eval)
                 args.writer.add_scalar("test/acc@1", top1, args.num_eval)
                 args.writer.add_scalar("test/acc@5", top5, args.num_eval)
-
-                args.writer.add_scalar("test/loss_t", test_loss_t, args.num_eval)
-                args.writer.add_scalar("test/acc_t@1", top1_t, args.num_eval)
-                args.writer.add_scalar("test/acc_t@5", top5_t, args.num_eval)
                 wandb.log({"test/loss": test_loss,
                            "test/acc@1": top1,
                            "test/acc@5": top5})
@@ -414,14 +289,6 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
 
                 logger.info(f"top-1 acc: {top1:.2f}")
                 logger.info(f"Best top-1 acc: {args.best_top1:.2f}")
-
-                is_best_t = top1 > args.best_top1_t
-                if is_best_t:
-                    args.best_top1_t = top1_t
-                    args.best_top5_t = top5_t
-
-                logger.info(f"top-1 acc: {top1_t:.2f}")
-                logger.info(f"Best top-1 acc: {args.best_top1_t:.2f}")
 
                 save_checkpoint(args, {
                     'step': step + 1,
@@ -456,7 +323,7 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
     return
 
 
-def evaluate(args, test_loader, model, criterion, bayes=False):
+def evaluate(args, test_loader, model, criterion):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -472,10 +339,7 @@ def evaluate(args, test_loader, model, criterion, bayes=False):
             images = images.to(args.device)
             targets = targets.to(args.device)
             with amp.autocast(enabled=args.amp):
-                if bayes:
-                    outputs, _, _, _, _ = model(images)
-                else:
-                    outputs = model(images)
+                outputs = model(images)
                 loss = criterion(outputs, targets)
 
             acc1, acc5 = accuracy(outputs, targets, (1, 5))
@@ -580,9 +444,6 @@ def main():
     args.best_top1 = 0.
     args.best_top5 = 0.
 
-    args.best_top1_t = 0.
-    args.best_top5_t = 0.
-
     if args.local_rank != -1:
         args.gpu = args.local_rank
         torch.distributed.init_process_group(backend='nccl')
@@ -649,7 +510,7 @@ def main():
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
-    teacher_model = BayesWrappedWideResNet(num_classes=args.num_classes,
+    teacher_model = WideResNet(num_classes=args.num_classes,
                                depth=depth,
                                widen_factor=widen_factor,
                                dropout=0,
@@ -677,7 +538,7 @@ def main():
     no_decay = ['bn']
     teacher_parameters = [
         {'params': [p for n, p in teacher_model.named_parameters() if not any(
-            nd in n for nd in no_decay)], 'weight_decay': 0.0},
+            nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
         {'params': [p for n, p in teacher_model.named_parameters() if any(
             nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
@@ -699,12 +560,6 @@ def main():
                             # weight_decay=args.weight_decay,
                             nesterov=args.nesterov)
 
-    s_optimizer_test = SGD_LM(student_parameters,
-                            lr=args.student_lr,
-                            momentum=args.momentum,
-                            # weight_decay=args.weight_decay,
-                            nesterov=args.nesterov)
-
     t_scheduler = get_cosine_schedule_with_warmup(t_optimizer,
                                                   args.warmup_steps,
                                                   args.total_steps)
@@ -712,10 +567,7 @@ def main():
                                                   args.warmup_steps,
                                                   args.total_steps,
                                                   args.student_wait_steps)
-    s_scheduler_test = get_cosine_schedule_with_warmup(s_optimizer_test,
-                                                  args.warmup_steps,
-                                                  args.total_steps,
-                                                  args.student_wait_steps)
+
     t_scaler = amp.GradScaler(enabled=args.amp)
     s_scaler = amp.GradScaler(enabled=args.amp)
 
@@ -771,11 +623,9 @@ def main():
 
     teacher_model.zero_grad()
     student_model.zero_grad()
-    
-    test_tool = (s_optimizer_test, s_scheduler_test)
     train_loop(args, labeled_loader, unlabeled_loader, test_loader,
                teacher_model, student_model, avg_student_model, criterion,
-               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler, test_tool)
+               t_optimizer, s_optimizer, t_scheduler, s_scheduler, t_scaler, s_scaler)
     return
 
 

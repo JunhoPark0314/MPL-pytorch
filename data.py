@@ -36,9 +36,17 @@ def get_cifar10(args):
     train_labeled_idxs, train_unlabeled_idxs = x_u_split(args, base_dataset.targets)
     # train_labeled_idxs, train_unlabeled_idxs = x_u_split_test(args, base_dataset.targets)
 
+    """
     train_labeled_dataset = CIFAR10SSL(
         args.data_path, train_labeled_idxs, train=True,
         transform=transform_labeled
+    )
+    """
+
+    train_labeled_dataset = CIFAR10SSL(
+        args.data_path, train_labeled_idxs,
+        train=True,
+        transform=TransformMPL(args, mean=cifar10_mean, std=cifar10_std)
     )
 
     train_unlabeled_dataset = CIFAR10SSL(
