@@ -193,7 +193,18 @@ def train_loop(args, labeled_loader, unlabeled_loader, test_loader,
             del s_logits
 
             s_loss_l_old = F.cross_entropy(s_logits_l.detach(), targets)
-            s_loss = criterion(s_logits_us, hard_pseudo_label)
+            
+            """
+            Although paper says that they use hard pseudo label, 
+            in their official implementation they use soft label
+            """
+            #s_loss = criterion(s_logits_us, hard_pseudo_label)
+            soft_label = torch.softmax(t_logits_us, dim=-1).detach()
+            smooth_positives = 1 - args.label_smoothing
+            smooth_negatives = args.label_smoothing / args.num_classes
+            soft_smooth_label = soft_label * smooth_positives + smooth_negatives
+
+            s_loss = (-soft_smooth_label *  s_logits_us.log_softmax(dim=-1)).mean()
 
         s_scaler.scale(s_loss).backward()
         if args.grad_clip > 0:
